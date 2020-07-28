@@ -1,0 +1,13 @@
+{
+  "template_lev": "res\\simpletemplate.lev",
+  "allowed_area": {
+    "points": [
+      [55.6, -95.2],
+      [98.5, -95.2],
+      [98.5, -76.1],
+      [55.6, -76.1]
+    ],
+    "verbs": ["Begin", "LineTo", "LineTo", "LineTo", "End"],
+    "num_attributes": 0
+  }
+}

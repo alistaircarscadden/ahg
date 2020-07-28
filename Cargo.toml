@@ -7,7 +7,9 @@ edition = "2018"
 
 [dependencies]
 elma = "0.1.14"
+euclid = "0.20.14"
+lyon = { version = "0.15.9", features = ["serialization"] }
 rand = "0.7.3"
 rand_distr = "0.2.2"
-lyon = "0.15.9"
-euclid = "0.20.14"
+serde = "1.0"
+serde_json = "1.0"

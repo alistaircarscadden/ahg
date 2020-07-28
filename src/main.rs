@@ -1,8 +1,8 @@
 mod geom;
 mod types;
 
+use crate::{geom::*, types::*};
 use elma::{lev::*, *};
-use geom::*;
 use lyon::{
     algorithms::hit_test::hit_test_path,
     math::point,
@@ -10,7 +10,14 @@ use lyon::{
 };
 use rand::{thread_rng, Rng};
 use rand_distr::{Normal, Uniform};
-use types::*;
+use serde::{Deserialize, Serialize};
+use std::{fs::File, time::Instant};
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    template_lev: String,
+    allowed_area: Path,
+}
 
 /// Describes a position for a polygon on the level.
 struct Placement {
@@ -22,90 +29,94 @@ struct Placement {
     apple: Option<Point>,
 }
 
-fn get_allowed_area() -> Path {
-    let mut builder = Path::builder();
-    builder.move_to(point(33.9, 23.6));
-    builder.line_to(point(12.7, 12.6));
-    builder.line_to(point(14.0, -4.0));
-    builder.line_to(point(26.0, -7.5));
-    builder.line_to(point(54.8, -6.4));
-    builder.line_to(point(62.6, -3.4));
-    builder.line_to(point(67.4, 3.5));
-    builder.line_to(point(70.7, 21.5));
-    builder.line_to(point(39.9, 24.0));
-    builder.line_to(point(37.2, 21.7));
-    builder.build()
-}
-
-fn generate_random_placement() -> Placement {
+fn generate_random_placement(bounding_min: &Point, bounding_max: &Point) -> Placement {
     let mut rng = thread_rng();
+
+    // Algorithm notes:
+    // The triangle is defined by (a, b, c) where a is the left vertex,
+    // b is the right vertex (roughly horizontal from a), and c is the
+    // top vertex (roughly half way horizontal between a and b).
+    // The triangle may be flipped, making c below the line ab.
+    // a starts at (0, 0) but is shifted at the end of the algorithm with
+    // the rest of the triangle.
+
+    // Probability the polygon will be flipped (into 'flat top' orientation)
     let p_vert_flip = 0.75;
+    // Probability an apple will be generated on this polygon
     let p_apple = 0.5;
-    let h_dist0 = Uniform::new(2.5, 5.0);
-    let v_dist0 = Normal::new(0.0, 0.3).unwrap();
-    let h_dist1 = Normal::new(1.0, 0.6).unwrap();
+    // Distribution of the horizontal delta of b from a
+    let b_hor_dist = Uniform::new(2.5, 5.0);
+    // Distribution of the vertical delta of b from a
+    let b_ver_dist = Normal::new(0.0, 0.3).unwrap();
+    // Distribution of the horizontal delta of c from a
+    let c_hor_dist = Normal::new(0.0, 0.6).unwrap();
+    // Minimum clamp of values sampled from b_hor_dist
     let h_min = 2.5;
+    // Minimum clamp of values sampled from v_dist1
     let v_min = 1.5;
+    // Distribution of triangle scaling
     let s_dist = Normal::new(1.0, 1.0).unwrap();
-    let ps_dist = Uniform::new(1.0, 3.0);
+    // Distribution of personal space
+    let ps_dist = Uniform::new(1.4, 3.8);
+    // Clamp values for personal space
     let ps_min = 1.0;
     let ps_max = 2.4;
 
-    let a = [0.0, 0.0];
+    let a = point(0.0, 0.0);
 
-    let b = [
-        a[0] + f64::max(rng.sample(h_dist0), h_min),
-        a[1] + rng.sample(v_dist0),
-    ];
+    let b = point(
+        a.x + f64::max(rng.sample(b_hor_dist), h_min),
+        a.y + rng.sample(b_ver_dist),
+    );
 
-    let width = f64::abs(b[0] - a[0]);
-    let v_dist1 = Normal::new(width / 4.0, width / 4.0).unwrap();
+    // Difference between b.x and a.x
+    let triangle_width = f64::abs(b.x - a.x);
+    // Distribution of the vertical delta of c from a
+    let c_ver_dist = Normal::new(triangle_width / 4.0, triangle_width / 4.0).unwrap();
+    // Whether or not the triangle will be flipped
     let will_vert_flip = rng.gen_bool(p_vert_flip);
-    let c = [
-        (b[0] + a[0]) / 2.0 + rng.sample(h_dist1),
+    let c = point((b.x + a.x) / 2.0 + rng.sample(c_hor_dist), {
+        let v_delta = f64::max(rng.sample(c_ver_dist), v_min);
         if will_vert_flip {
-            a[1] - f64::max(rng.sample(v_dist1), v_min)
+            a.y - v_delta
         } else {
-            a[1] + f64::max(rng.sample(v_dist1), v_min)
-        },
-    ];
+            a.y + v_delta
+        }
+    });
 
+    // Distribution of rotation, depends on whether or not its a flat top
+    // or flat bottom triangle
     let r_dist_rads = if will_vert_flip {
         Normal::new(0.0, 0.1).unwrap()
     } else {
         Normal::new(0.0, 0.2617994).unwrap()
     };
 
+    // Scaling factor for the entire triangle
     let scale = f64::max(rng.sample(s_dist), 1.0);
-    let shift_x = rng.gen_range(13.0, 61.0);
-    let shift_y = rng.gen_range(-4.0, 21.0);
 
-    let triangle = points_to_triangle(
-        coords_to_point(&a),
-        coords_to_point(&b),
-        coords_to_point(&c),
-    )
-    .transform(
-        &Transform::create_scale(scale, scale).post_translate(Vector::new(shift_x, shift_y)),
+    // Shifting for the entire triangle
+    let shift = Vector::new(
+        rng.gen_range(bounding_min.x, bounding_max.x),
+        rng.gen_range(bounding_min.y, bounding_max.y),
     );
     let rot_rads = rng.sample(r_dist_rads);
+    let triangle = Triangle { a, b, c }
+        .transform(&Transform::create_scale(scale, scale).post_translate(shift));
     let triangle = triangle.rotate_about(&triangle.center(), rot_rads);
 
     let personal_space = f64::min(ps_max, f64::max(ps_min, rng.sample(ps_dist)));
 
     let apple = if rng.gen_bool(p_apple) {
-        Some(Point::new(
-            if will_vert_flip {
-                (triangle.b.x + triangle.a.x) / 2.0
-            } else {
-                triangle.c.x
-            },
-            if will_vert_flip {
-                (triangle.b.y + triangle.a.y) / 2.0
-            } else {
-                triangle.c.y
-            } + 0.8,
-        ))
+        let vert_shift_apple = 0.8;
+        Some(if will_vert_flip {
+            Point::new(
+                (triangle.b.x + triangle.a.x) / 2.0,
+                (triangle.b.y + triangle.a.y) / 2.0 + vert_shift_apple,
+            )
+        } else {
+            Point::new(triangle.c.x, triangle.c.y + vert_shift_apple)
+        })
     } else {
         None
     };
@@ -127,15 +138,7 @@ fn apple_at(position: &Point) -> Object {
     object
 }
 
-fn coords_to_point(arr: &[f64; 2]) -> Point {
-    Point::new(arr[0], arr[1])
-}
-
-fn points_to_triangle(a: Point, b: Point, c: Point) -> Triangle {
-    Triangle { a, b, c }
-}
-
-fn triangle_to_polygon(triangle: &Triangle) -> Polygon {
+fn triangle_to_elma_polygon(triangle: &Triangle) -> Polygon {
     let mut polygon = Polygon::new();
     polygon
         .vertices
@@ -149,7 +152,7 @@ fn triangle_to_polygon(triangle: &Triangle) -> Polygon {
     polygon
 }
 
-fn path_to_polygon(path: &Path) -> Polygon {
+fn path_to_elma_polygon(path: &Path) -> Polygon {
     use lyon::path::Event;
 
     let mut polygon = Polygon::new();
@@ -178,28 +181,58 @@ fn path_contains_triangle(path: &Path, triangle: &Triangle) -> bool {
         && hit_test_path(&c, path.iter(), FillRule::NonZero, tolerance)
 }
 
+fn path_bounding_box(path: &Path) -> Rect {
+    let rectf32 = lyon::algorithms::aabb::bounding_rect(path.iter());
+    Rect::new(
+        Point::new(rectf32.origin.x as f64, rectf32.origin.y as f64),
+        Size::new(rectf32.size.width as f64, rectf32.size.height as f64),
+    )
+}
+
 fn main() {
-    let mut lev = Level::load("aht.lev").unwrap();
+    let config: Config = {
+        let path = if let Some(path) = std::env::args().nth(1) {
+            println!("Using config: {} instead of default", &path);
+            path
+        } else {
+            String::from("config_default.json")
+        };
+        let file = File::open(&path).unwrap();
+        serde_json::from_reader(file).unwrap()
+    };
+    let mut lev = Level::load(&config.template_lev).unwrap();
     let mut placements = Vec::<Placement>::new();
     let mut n_valid_placements = 0;
     let mut n_attempted_placements = 0;
-    let allowed_area = get_allowed_area();
+    let (bounding_min, bounding_max) = {
+        let bounding_area = path_bounding_box(&config.allowed_area);
+        (
+            Point::new(bounding_area.origin.x, bounding_area.origin.y),
+            Point::new(
+                bounding_area.origin.x + bounding_area.size.width,
+                bounding_area.origin.y + bounding_area.size.height,
+            ),
+        )
+    };
 
-    while n_attempted_placements < 120000 {
+    let start = Instant::now();
+
+    while n_attempted_placements < 120_000 {
         n_attempted_placements += 1;
-        let new_placement = generate_random_placement();
+        let new_placement = generate_random_placement(&bounding_min, &bounding_max);
         if placements.iter().all(|placement| {
             let dist = placement.triangle.distance_to(&new_placement.triangle);
             dist > placement.personal_space && dist > new_placement.personal_space
-        }) && path_contains_triangle(&allowed_area, &new_placement.triangle)
+        }) && path_contains_triangle(&config.allowed_area, &new_placement.triangle)
         {
             n_valid_placements += 1;
-            println!("{} / {}", n_valid_placements, n_attempted_placements);
+            println!("Elapsed: {:?} (placed: {}, attempts: {})", start.elapsed(), n_valid_placements, n_attempted_placements);
             placements.push(new_placement);
         }
     }
+    println!("Elapsed: {:?} (Triangle generation complete)", start.elapsed());
     for placement in &placements {
-        lev.polygons.push(triangle_to_polygon(&placement.triangle));
+        lev.polygons.push(triangle_to_elma_polygon(&placement.triangle));
         if let Some(apple) = &placement.apple {
             if placements
                 .iter()
@@ -209,7 +242,9 @@ fn main() {
             }
         }
     }
-    lev.save("ah.lev", Top10Save::Yes).unwrap();
+    println!("Apple validation: {:?}", start.elapsed());
+    lev.title.push_str("auto lev");
+    lev.save("out.lev", Top10Save::Yes).unwrap();
 }
 
 #[test]
